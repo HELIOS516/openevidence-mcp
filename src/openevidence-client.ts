@@ -1,6 +1,5 @@
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { constants } from "node:fs";
-import { request, type APIRequestContext } from "playwright";
 
 import type { AppConfig } from "./config.js";
 import type { AuthStatusResult, OpenEvidenceAskRequest, WaitOptions } from "./types.js";
@@ -8,29 +7,59 @@ import type { AuthStatusResult, OpenEvidenceAskRequest, WaitOptions } from "./ty
 const DEFAULT_ARTICLE_TYPE = "Ask OpenEvidence Light with citations";
 const PENDING_STATUSES = new Set(["queued", "pending", "processing", "running", "in_progress"]);
 
+interface StorageState {
+  cookies: Array<{
+    name: string;
+    value: string;
+    domain: string;
+    path: string;
+    [key: string]: unknown;
+  }>;
+  origins: unknown[];
+}
+
 export class OpenEvidenceClient {
-  private ctx: APIRequestContext | null = null;
+  private headers: Record<string, string> = {};
+  private postHeaders: Record<string, string> = {};
 
   constructor(private readonly config: AppConfig) {}
 
   async init(): Promise<void> {
     await access(this.config.authStatePath, constants.R_OK);
-    this.ctx = await request.newContext({
-      baseURL: this.config.baseUrl,
-      storageState: this.config.authStatePath,
-    });
+    const raw = await readFile(this.config.authStatePath, "utf-8");
+    const state = JSON.parse(raw) as StorageState;
+
+    const cookieHeader = state.cookies
+      .filter(
+        (c) =>
+          c.domain === "www.openevidence.com" ||
+          c.domain === ".openevidence.com" ||
+          c.domain === "openevidence.com" ||
+          c.domain === "auth.openevidence.com" ||
+          c.domain === ".auth.openevidence.com",
+      )
+      .map((c) => `${c.name}=${c.value}`)
+      .join("; ");
+
+    this.headers = {
+      Cookie: cookieHeader,
+      "User-Agent": this.config.userAgent,
+      Accept: "application/json",
+    };
+
+    this.postHeaders = {
+      ...this.headers,
+      "Content-Type": "application/json",
+    };
   }
 
   async close(): Promise<void> {
-    if (this.ctx) {
-      await this.ctx.dispose();
-      this.ctx = null;
-    }
+    // no-op: no context to dispose
   }
 
   async getAuthStatus(): Promise<AuthStatusResult> {
-    const res = await this.api().get("/api/auth/me");
-    const statusCode = res.status();
+    const res = await this.fetchGet("/api/auth/me");
+    const statusCode = res.status;
     if (statusCode !== 200) {
       return {
         authenticated: false,
@@ -102,22 +131,27 @@ export class OpenEvidenceClient {
     }
   }
 
-  private api(): APIRequestContext {
-    if (!this.ctx) {
-      throw new Error("OpenEvidence client is not initialized.");
-    }
-    return this.ctx;
+  private fetchGet(url: string): Promise<Response> {
+    return fetch(this.config.baseUrl + url, { headers: this.headers });
+  }
+
+  private fetchPost(url: string, body: unknown): Promise<Response> {
+    return fetch(this.config.baseUrl + url, {
+      method: "POST",
+      headers: this.postHeaders,
+      body: JSON.stringify(body),
+    });
   }
 
   private async getJson(url: string): Promise<unknown> {
     const res = await this.getWithRetry(url, 3);
-    await assertJsonResponse(res.status(), url);
+    await assertJsonResponse(res, url);
     return res.json();
   }
 
   private async postJson(url: string, body: unknown): Promise<unknown> {
     const res = await this.postWithRetry(url, body, 2);
-    const status = res.status();
+    const status = res.status;
     if (status !== 200 && status !== 201) {
       const text = await res.text();
       throw new Error(`POST ${url} failed: ${status} ${text.slice(0, 400)}`);
@@ -125,36 +159,37 @@ export class OpenEvidenceClient {
     return res.json();
   }
 
-  private async getWithRetry(url: string, attempts: number) {
-    let last = await this.api().get(url);
+  private async getWithRetry(url: string, attempts: number): Promise<Response> {
+    let last = await this.fetchGet(url);
     for (let i = 1; i < attempts; i++) {
-      if (last.status() < 500) {
+      if (last.status < 500) {
         return last;
       }
       await sleep(i * 400);
-      last = await this.api().get(url);
+      last = await this.fetchGet(url);
     }
     return last;
   }
 
-  private async postWithRetry(url: string, body: unknown, attempts: number) {
-    let last = await this.api().post(url, { data: body });
+  private async postWithRetry(url: string, body: unknown, attempts: number): Promise<Response> {
+    let last = await this.fetchPost(url, body);
     for (let i = 1; i < attempts; i++) {
-      if (last.status() < 500) {
+      if (last.status < 500) {
         return last;
       }
       await sleep(i * 400);
-      last = await this.api().post(url, { data: body });
+      last = await this.fetchPost(url, body);
     }
     return last;
   }
 }
 
-async function assertJsonResponse(status: number, url: string): Promise<void> {
-  if (status >= 200 && status < 300) {
+async function assertJsonResponse(res: Response, url: string): Promise<void> {
+  if (res.status >= 200 && res.status < 300) {
     return;
   }
-  throw new Error(`GET ${url} failed with status ${status}`);
+  const text = await res.text();
+  throw new Error(`GET ${url} failed: ${res.status} ${text.slice(0, 400)}`);
 }
 
 function sleep(ms: number): Promise<void> {

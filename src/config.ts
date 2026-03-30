@@ -8,6 +8,7 @@ export interface AppConfig {
   userDataDir: string;
   pollIntervalMs: number;
   pollTimeoutMs: number;
+  userAgent: string;
 }
 
 const DEFAULT_BASE_URL = "https://www.openevidence.com";
@@ -27,6 +28,9 @@ export function resolveConfig(): AppConfig {
     userDataDir,
     pollIntervalMs: parseInt(process.env.OE_MCP_POLL_INTERVAL_MS ?? "1200", 10),
     pollTimeoutMs: parseInt(process.env.OE_MCP_POLL_TIMEOUT_MS ?? "180000", 10),
+    userAgent:
+      process.env.OE_MCP_USER_AGENT ??
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.165 Safari/537.36",
   };
 }
 
